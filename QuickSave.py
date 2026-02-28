@@ -10,14 +10,18 @@ Installation :
   Copiez QuickSave.py dans :
     Documents/Electronic Arts/The Sims 4/Mods/
 
+  Activez les mods de script dans :
+    Options du jeu → Autres → Activer les mods de script
+
 Changer la touche :
   Modifiez la valeur de QUICKSAVE_KEY_VK ci-dessous.
   Codes courants (Windows Virtual Key) :
     F5  = 0x74  (défaut)
     F6  = 0x75
     F7  = 0x76
+    F8  = 0x77
     F9  = 0x78
-    Orig/Home = 0x24
+    F10 = 0x79
 """
 
 import sims4
@@ -31,7 +35,8 @@ import time
 # ============================================================
 
 QUICKSAVE_KEY_VK = 0x74   # F5 par défaut
-CHECK_INTERVAL   = 0.15   # Intervalle de vérification en secondes (0.15 = 150 ms)
+CHECK_INTERVAL   = 0.15   # Intervalle de vérification en secondes
+SAVE_COOLDOWN    = 3.0    # Délai minimum entre deux sauvegardes (secondes)
 
 # ============================================================
 
@@ -62,46 +67,84 @@ def _is_key_down(vk_code):
 # ---- État interne ----
 _prev_key_state   = False   # État de la touche lors du dernier cycle
 _last_poll_time   = 0.0     # Horodatage du dernier sondage
+_last_save_time   = 0.0     # Horodatage de la dernière sauvegarde
 _save_in_progress = False   # Verrou anti-double sauvegarde
 
 
+def _game_is_ready():
+    """Retourne True uniquement si une zone jouable est bien active."""
+    try:
+        zone = services.current_zone()
+        if zone is None:
+            return False
+        # Vérifier les attributs de statut selon la version du jeu
+        for attr in ('is_zone_running', 'is_fully_loaded', 'is_active'):
+            val = getattr(zone, attr, None)
+            if val is not None:
+                return bool(val)
+        return True  # Zone présente mais sans attribut de statut connu
+    except Exception:
+        return False
+
+
 def _perform_save(source='hotkey'):
-    """Déclenche une sauvegarde du jeu."""
-    global _save_in_progress
+    """Déclenche une sauvegarde du jeu avec plusieurs méthodes en fallback."""
+    global _save_in_progress, _last_save_time
 
     if _save_in_progress:
         sims4.log.warn('QuickSave', 'Sauvegarde déjà en cours, requête ignorée.')
         return
 
-    # Vérifie qu'une zone est bien active
-    zone = services.current_zone()
-    if zone is None:
-        sims4.log.warn('QuickSave', 'Aucune zone active — sauvegarde impossible.')
+    # Cooldown anti-rafale
+    if time.time() - _last_save_time < SAVE_COOLDOWN:
         return
 
+    if not _game_is_ready():
+        sims4.log.warn('QuickSave', 'Zone non prête — sauvegarde ignorée.')
+        return
+
+    _save_in_progress = True
     try:
-        _save_in_progress = True
-        persistence_service = services.get_persistence_service()
-        if persistence_service is None:
-            sims4.log.warn('QuickSave', 'Service de persistance introuvable.')
-            return
+        saved = False
 
-        # Sauvegarde dans l'emplacement courant
-        persistence_service.save_using(
-            persistence_service.save_game_gen,
-            None,                   # slot_id None = emplacement en cours
-            send_save_success=True, # Affiche la notification native du jeu
-            auto_save=False
-        )
+        # Méthode 1 — persistence_service (comportement natif du jeu)
+        try:
+            ps = services.get_persistence_service()
+            if ps is not None:
+                ps.save_using(
+                    ps.save_game_gen,
+                    None,                   # slot_id None = emplacement en cours
+                    send_save_success=True, # Affiche la notification native du jeu
+                    auto_save=False
+                )
+                saved = True
+        except Exception:
+            sims4.log.warn('QuickSave', 'Méthode 1 échouée :\n' + traceback.format_exc())
 
-        f_num = QUICKSAVE_KEY_VK - 0x6F  # Convertit le code VK en numéro Fn
-        sims4.log.info(
-            'QuickSave',
-            'Partie sauvegardée via {} (F{}).'.format(source, f_num)
-        )
+        # Méthode 2 — client (bouton Enregistrer du menu)
+        if not saved:
+            try:
+                client_mgr = services.client_manager()
+                if client_mgr is not None:
+                    client = client_mgr.get_first_client()
+                    if client is not None:
+                        for method_name in ('save_game', 'save', 'trigger_save'):
+                            fn = getattr(client, method_name, None)
+                            if fn is not None:
+                                fn()
+                                saved = True
+                                break
+            except Exception:
+                sims4.log.warn('QuickSave', 'Méthode 2 échouée :\n' + traceback.format_exc())
+
+        if saved:
+            _last_save_time = time.time()
+            sims4.log.info('QuickSave', 'Partie sauvegardée (via {}).'.format(source))
+        else:
+            sims4.log.error('QuickSave', 'Toutes les méthodes de sauvegarde ont échoué.')
 
     except Exception:
-        sims4.log.exception('QuickSave', 'Erreur lors de la sauvegarde :\n' + traceback.format_exc())
+        sims4.log.exception('QuickSave', 'Erreur inattendue :\n' + traceback.format_exc())
     finally:
         _save_in_progress = False
 
@@ -112,7 +155,7 @@ def _poll_hotkey():
 
     now = time.time()
     if now - _last_poll_time < CHECK_INTERVAL:
-        return  # Pas encore le moment de vérifier
+        return
     _last_poll_time = now
 
     current = _is_key_down(QUICKSAVE_KEY_VK)
@@ -165,7 +208,7 @@ def cmd_quicksave(_connection=None):
 # Message de confirmation au chargement du mod
 sims4.log.info(
     'QuickSave',
-    'Mod chargé ! Raccourci : F{} | Console : "quicksave"'.format(
+    'Mod chargé ! Raccourci : F{} | Console de triche : "quicksave"'.format(
         QUICKSAVE_KEY_VK - 0x6F
     )
 )
